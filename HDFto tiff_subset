@@ -1,0 +1,167 @@
+import os
+from osgeo import gdal
+import rasterio
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rasterio.mask import mask
+import fiona
+from shapely.geometry import shape
+from rasterio.crs import CRS
+
+def hdf_to_tiff(hdf_path, tiff_folder, subdataset_indices):
+    hdf_dataset = gdal.Open(hdf_path, gdal.GA_ReadOnly)
+    if not hdf_dataset:
+        raise FileNotFoundError(f"Unable to open HDF file: {hdf_path}")
+
+    subdatasets = hdf_dataset.GetSubDatasets()
+    if not subdatasets:
+        raise ValueError(f"No subdatasets found in HDF file: {hdf_path}")
+
+    tiff_paths = []
+    for idx in subdataset_indices:
+        subdataset_path, subdataset_description = subdatasets[idx]
+        subdataset = gdal.Open(subdataset_path, gdal.GA_ReadOnly)
+        if not subdataset:
+            raise FileNotFoundError(f"Unable to open subdataset: {subdataset_path}")
+
+        subdataset_name = subdataset_description.split(':')[-1].replace(' ', '_')
+        tiff_filename = os.path.splitext(os.path.basename(hdf_path))[0] + f"_{subdataset_name}_{idx}.tif"
+        tiff_path = os.path.join(tiff_folder, tiff_filename)
+
+        driver = gdal.GetDriverByName('GTiff')
+        tiff_dataset = driver.CreateCopy(tiff_path, subdataset, 0)
+        if not tiff_dataset:
+            raise RuntimeError(f"Unable to create TIFF file: {tiff_path}")
+
+        tiff_paths.append(tiff_path)
+        tiff_dataset = None  # Close the dataset
+
+        print(f"Converted subdataset {idx} from {hdf_path} to {tiff_path}")
+
+    return tiff_paths
+
+def create_composite_band(tiff_paths, output_path):
+    if not tiff_paths:
+        raise ValueError("No TIFF paths provided for compositing.")
+
+    first_image = gdal.Open(tiff_paths[0], gdal.GA_ReadOnly)
+    cols = first_image.RasterXSize
+    rows = first_image.RasterYSize
+    bands = len(tiff_paths)
+    geotransform = first_image.GetGeoTransform()
+    projection = first_image.GetProjection()
+
+    driver = gdal.GetDriverByName('GTiff')
+    composite = driver.Create(output_path, cols, rows, bands, gdal.GDT_Float32)
+    composite.SetGeoTransform(geotransform)
+    composite.SetProjection(projection)
+
+    for i, tiff_path in enumerate(tiff_paths):
+        tiff_image = gdal.Open(tiff_path, gdal.GA_ReadOnly)
+        band_data = tiff_image.GetRasterBand(1).ReadAsArray()
+        composite.GetRasterBand(i+1).WriteArray(band_data)
+
+    composite = None  # Close the composite file
+    print(f"Composite band created at {output_path}")
+
+def reproject_and_clip(tiff_dir, shapefile_path, output_dir):
+    # Load the CRS and shapes from the shapefile
+    with fiona.open(shapefile_path, 'r') as shapefile:
+        shapefile_crs = shapefile.crs
+        shapes = [feature["geometry"] for feature in shapefile]
+
+    # Check and convert CRS
+    if 'init' in shapefile_crs:
+        shapefile_crs = CRS.from_string(shapefile_crs['init'])
+    else:
+        shapefile_crs = CRS.from_wkt(shapefile_crs.to_wkt())
+
+    # Ensure the output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Process each TIFF file in the directory
+    for filename in os.listdir(tiff_dir):
+        if filename.endswith('.tif'):
+            tiff_path = os.path.join(tiff_dir, filename)
+            output_tiff_path = os.path.join(output_dir, f'{os.path.splitext(filename)[0]}_clipped.tif')
+
+            with rasterio.open(tiff_path) as src:
+                # Reproject the raster to match the shapefile CRS
+                transform, width, height = calculate_default_transform(
+                    src.crs, shapefile_crs, src.width, src.height, *src.bounds)
+                
+                kwargs = src.meta.copy()
+                kwargs.update({
+                    'crs': shapefile_crs,
+                    'transform': transform,
+                    'width': width,
+                    'height': height
+                })
+
+                with rasterio.MemoryFile() as memfile:
+                    with memfile.open(**kwargs) as mem:
+                        for i in range(1, src.count + 1):
+                            reproject(
+                                source=rasterio.band(src, i),
+                                destination=rasterio.band(mem, i),
+                                src_transform=src.transform,
+                                src_crs=src.crs,
+                                dst_transform=transform,
+                                dst_crs=shapefile_crs,
+                                resampling=Resampling.nearest)
+
+                        # Clip the reprojected raster with the shapefile geometry
+                        out_image, out_transform = mask(mem, shapes, crop=True)
+                        
+                        # Update metadata and write clipped image
+                        out_meta = mem.meta.copy()
+                        out_meta.update({
+                            "driver": "GTiff",
+                            "height": out_image.shape[1],
+                            "width": out_image.shape[2],
+                            "transform": out_transform
+                        })
+                        
+                        with rasterio.open(output_tiff_path, "w", **out_meta) as dst:
+                            dst.write(out_image)
+
+            print(f"Reprojection and clipping complete for {filename}. The output file is saved at: {output_tiff_path}")
+
+def convert_composite_and_clip(hdf_folder, tiff_folder, composite_folder, shapefile_path, clipped_folder, subdataset_indices):
+    if not os.path.exists(hdf_folder):
+        raise FileNotFoundError(f"The folder {hdf_folder} does not exist.")
+
+    if not os.path.exists(tiff_folder):
+        os.makedirs(tiff_folder)
+
+    if not os.path.exists(composite_folder):
+        os.makedirs(composite_folder)
+
+    if not os.path.exists(clipped_folder):
+        os.makedirs(clipped_folder)
+
+    hdf_files = [f for f in os.listdir(hdf_folder) if f.endswith(".hdf") or f.endswith(".h5")]
+
+    if not hdf_files:
+        print(f"No HDF files found in the folder {hdf_folder}.")
+        return
+
+    for filename in hdf_files:
+        hdf_path = os.path.join(hdf_folder, filename)
+        tiff_paths = hdf_to_tiff(hdf_path, tiff_folder, subdataset_indices)
+
+        composite_filename = os.path.splitext(os.path.basename(hdf_path))[0] + "_composite.tif"
+        composite_path = os.path.join(composite_folder, composite_filename)
+
+        create_composite_band(tiff_paths, composite_path)
+
+    reproject_and_clip(composite_folder, shapefile_path, clipped_folder)
+
+# Example usage:
+hdf_folder = r'D:\MODIS Data\HDF'
+tiff_folder = r'D:\MODIS Data\TIFF'
+composite_folder = r'D:\MODIS Data\Composit Tiff'
+clipped_folder = r'D:\MODIS Data\Clipped Raster'
+shapefile_path = r'D:\study_area.shp'
+subdataset_indices = [11, 12, 13, 14, 15, 16, 17]  # Specify the indices of the subdatasets you want to extract
+
+convert_composite_and_clip(hdf_folder, tiff_folder, composite_folder, shapefile_path, clipped_folder, subdataset_indices)
